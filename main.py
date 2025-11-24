@@ -150,6 +150,10 @@ def detect_bad_words(
     out["_detection_time_seconds"] = round(end_time - start_time, 4)
     return out
 
+@app.get("/")
+async def root():
+    return {"message": "Welcome to WZDetect"}
+
 @app.post("/detect")
 async def detect(request: DetectRequest, client_ip: Optional[str] = None):
     if client_ip is None:
