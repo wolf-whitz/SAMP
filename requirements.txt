@@ -1,0 +1,8 @@
+fastapi 
+uvicorn 
+sentence-transformers 
+torch 
+pandas 
+regex 
+pydantic 
+datasets 
