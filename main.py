@@ -2,11 +2,11 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from sentence_transformers import SentenceTransformer, util
-import torch
 import pickle
 import os
 import time
 import asyncio
+import numpy as np
 from mapping import split_text, generate_variants
 
 app = FastAPI(title="WZDetect")
@@ -99,12 +99,18 @@ def detect_bad_words(
         token_embeddings.append(emb)
         token_variants_map.append(variants)
 
+    badword_emb_np = badword_embeddings.cpu().numpy() if hasattr(badword_embeddings, 'cpu') else np.array(badword_embeddings)
+
     for tok, emb_variants, variants in zip(tokens, token_embeddings, token_variants_map):
         flagged = False
-        scores = util.cos_sim(emb_variants, badword_embeddings)
-        max_score, idx = torch.max(scores, dim=1)
-        for score_val, i in zip(max_score, idx):
-            bw = variant_to_badword[i.item()]
+        emb_np = emb_variants.cpu().numpy() if hasattr(emb_variants, 'cpu') else np.array(emb_variants)
+        scores = np.matmul(emb_np, badword_emb_np.T)
+
+        max_idx = np.argmax(scores, axis=1)
+        max_score = scores[np.arange(len(max_idx)), max_idx]
+
+        for score_val, i in zip(max_score, max_idx):
+            bw = variant_to_badword[i]
             bw_meta = badword_meta[bw]
             bw_category = bw_meta.get("profanity_category")
             bw_language = bw_meta.get("language")
@@ -122,7 +128,7 @@ def detect_bad_words(
                 flagged = True
                 break
 
-            if score_val.item() > effective_threshold:
+            if score_val > effective_threshold:
                 if languages and bw_language not in languages:
                     continue
                 out[tok] = {
