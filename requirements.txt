@@ -1,8 +1,8 @@
-fastapi 
-uvicorn 
-sentence-transformers 
-numpy 
-pandas 
-regex 
-pydantic 
-datasets 
+uvicorn
+sentence-transformers
+numpy
+pandas
+regex
+pydantic
+datasets
+streamlit
