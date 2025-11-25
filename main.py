@@ -1,22 +1,29 @@
-import streamlit as st
-from sentence_transformers import SentenceTransformer
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+from sentence_transformers import SentenceTransformer, util
 import pickle
 import os
-import numpy as np
 import time
+import asyncio
+import numpy as np
 from mapping import split_text, generate_variants
 
-st.set_page_config(page_title="WZDetect", layout="wide")
+app = FastAPI(title="WZDetect")
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 BASE_DIR = os.path.dirname(__file__)
 BADWORDS_PATH = os.path.join(BASE_DIR, "model", "badwords_meta.pkl")
 
+if not os.path.exists(BADWORDS_PATH):
+    raise FileNotFoundError(f"Could not find badwords_meta.pkl at {BADWORDS_PATH}")
+
 with open(BADWORDS_PATH, "rb") as f:
-    badword_meta = pickle.load(f)
+    badword_meta: Dict[str, Dict] = pickle.load(f)
 
 badwords = list(badword_meta.keys())
+
 variant_cache = {}
 all_variant_texts = []
 variant_to_badword = []
@@ -29,15 +36,52 @@ for bw in badwords:
 
 badword_embeddings = model.encode(all_variant_texts, convert_to_tensor=True)
 
+MAX_QUEUE_PER_IP = 20
+queues = {}
+locks = {}
+
+async def check_rate_limit(client_ip: str):
+    if client_ip not in queues:
+        queues[client_ip] = asyncio.Queue(maxsize=MAX_QUEUE_PER_IP)
+        locks[client_ip] = asyncio.Lock()
+
+    if queues[client_ip].full():
+        raise HTTPException(status_code=429, detail="Too many queued requests")
+
+    fut = asyncio.get_event_loop().create_future()
+    await queues[client_ip].put(fut)
+
+    while queues[client_ip]._queue[0] is not fut:
+        await fut
+
+    await locks[client_ip].acquire()
+
+async def release_rate_limit(client_ip: str):
+    locks[client_ip].release()
+    if not queues[client_ip].empty():
+        finished = await queues[client_ip].get()
+        if not finished.done():
+            finished.set_result(True)
+
+class DetectRequest(BaseModel):
+    text: str
+    threshold: Optional[float] = 0.72
+    custom_threshold: Optional[Dict[str, float]] = None
+    include_variants: Optional[bool] = True
+    max_tokens: Optional[int] = 200
+    languages: Optional[List[str]] = None
+    block: Optional[List[str]] = []
+    return_only_flagged: Optional[bool] = False
+
 def detect_bad_words(
-    text,
-    threshold=0.72,
-    custom_threshold=None,
-    include_variants=True,
-    block=None,
-    max_tokens=200,
-    languages=None,
-    return_only_flagged=False
+    text: str,
+    threshold: float = 0.72,
+    custom_threshold: Optional[Dict[str, float]] = None,
+    include_variants: bool = True,
+    block: Optional[List[str]] = None,
+    max_tokens: int = 200,
+    languages: Optional[List[str]] = None,
+    return_only_flagged: bool = False
 ):
     start_time = time.time()
     tokens = split_text(text)[:max_tokens]
@@ -106,29 +150,26 @@ def detect_bad_words(
     out["_detection_time_seconds"] = round(end_time - start_time, 4)
     return out
 
-st.title("WZDetect UI")
+@app.get("/")
+async def root():
+    return {"message": "Welcome to WZDetect"}
 
-text = st.text_area("Drop your text here")
-
-threshold = st.slider("Threshold", 0.0, 1.0, 0.72)
-include_variants = st.checkbox("Include Variants", True)
-return_only_flagged = st.checkbox("Return Only Flagged", False)
-max_tokens = st.number_input("Max Tokens", 1, 500, 200)
-
-langs_input = st.text_input("Filter Languages (comma separated)")
-languages = [l.strip() for l in langs_input.split(",")] if langs_input else None
-
-block_input = st.text_input("Block Specific Tokens (comma separated)")
-block = [b.strip() for b in block_input.split(",")] if block_input else None
-
-if st.button("Run Detection"):
-    res = detect_bad_words(
-        text=text,
-        threshold=threshold,
-        include_variants=include_variants,
-        block=block,
-        max_tokens=max_tokens,
-        languages=languages,
-        return_only_flagged=return_only_flagged
-    )
-    st.json(res)
+@app.post("/detect")
+async def detect(request: DetectRequest, client_ip: Optional[str] = None):
+    if client_ip is None:
+        client_ip = "default"
+    await check_rate_limit(client_ip)
+    try:
+        result = detect_bad_words(
+            text=request.text,
+            threshold=request.threshold,
+            custom_threshold=request.custom_threshold,
+            include_variants=request.include_variants,
+            block=request.block,
+            max_tokens=request.max_tokens,
+            languages=request.languages,
+            return_only_flagged=request.return_only_flagged
+        )
+    finally:
+        await release_rate_limit(client_ip)
+    return {"input": request.text, "detection": result}
